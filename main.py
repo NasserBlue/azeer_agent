@@ -75,7 +75,7 @@ assignment_notifier_agent = Agent(
     name="AssignmentNotifierAgent",
     model="gemini-2.5-flash",
     description="Formats and dispatches notifications when a conversation is assigned to an agent.",
-    instructions="""
+    instruction="""
     You handle chat assignment alerts.
     Given customer details and the assigned representative:
     1. Construct a clean, professional English alert.
@@ -94,7 +94,7 @@ message_summary_agent = Agent(
     name="MessageSummaryAgent",
     model="gemini-2.5-flash",
     description="Buffers incoming customer messages and summarizes customer requests for the supervisor.",
-    instructions="""
+    instruction="""
     You summarize incoming customer inquiries.
     1. Parse the inbound text messages from the customer.
     2. Produce an executive alert in English indicating what the customer needs.
@@ -112,7 +112,7 @@ root_agent = Agent(
     name="RootAgent",
     model="gemini-2.5-flash",
     description="Orchestrator for managing WhatsApp customer operations and dispatching tasks to specialized sub-agents.",
-    instructions="""
+    instruction="""
     You are the central supervisor agent for Azeer customer operations.
     Route incoming webhook tasks:
     - Route conversation assignment tasks to AssignmentNotifierAgent.
