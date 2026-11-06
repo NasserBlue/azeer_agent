@@ -322,3 +322,49 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
+# checking message summary
+def process_customer_inquiry_summary(platform_id: str):
+    """Processes aggregated messages after 4 messages or timeout."""
+    data = CUSTOMER_MESSAGE_BUFFERS.pop(platform_id, None)
+    if not data or not data["messages"]:
+        return
+
+    contact_name = data["contact_name"]
+    full_conversation = "\n".join([f"- {m}" for m in data["messages"]])
+    logging.info("Generating summary for %s with %d messages", contact_name, len(data["messages"]))
+
+    task_prompt = (
+        f"Analyze these inbound customer messages and write a 1-sentence English alert for the supervisor:\n"
+        f"Customer: {contact_name} ({platform_id})\n"
+        f"Messages:\n{full_conversation}\n\n"
+        f"Format:\n"
+        f"📩 Inquiry Summary\n"
+        f"Client: {contact_name} ({platform_id})\n"
+        f"Summary: The client is asking about [topic]."
+    )
+
+    summary_text = ""
+    try:
+        # Use root_agent / sub-agent or direct model generation
+        result = message_summary_agent.run(task_prompt)
+        summary_text = str(result)
+    except Exception as exc:
+        logging.error("Agent execution error, falling back to direct summary: %s", exc)
+        try:
+            from google import genai
+            client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+            res = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=task_prompt
+            )
+            summary_text = res.text.strip()
+        except Exception as gen_err:
+            logging.error("Direct fallback failed: %s", gen_err)
+            summary_text = f"📩 Inquiry Alert: Customer {contact_name} ({platform_id}) sent {len(data['messages'])} messages."
+
+    # Send to supervisor via text, fallback to template if window closed
+    resp = send_whatsapp_text(SUPERVISOR_NUMBER, summary_text)
+    if not resp or resp.get("status") in ["failed", "error"] or "error" in resp:
+        logging.info("Text send blocked (session closed). Dispatching template fallback...")
+        send_whatsapp_template(SUPERVISOR_NUMBER, DEFAULT_TEMPLATE_NAME, contact_name)
