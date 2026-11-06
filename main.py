@@ -84,8 +84,8 @@ assignment_notifier_agent = Agent(
        Customer: [Customer Name] ([Phone Number])
        Assigned To: [Agent Name]
        Status: Active
-    3. Use send_whatsapp_text to deliver the message to the supervisor.
-    If delivery fails due to session expiry, use send_whatsapp_template with welcome03.
+    3. Use send_whatsapp_text to deliver the message to the {SUPERVISOR?}.
+    If delivery fails due to session expiry, use send_whatsapp_template with {welcome03?}.
     """,
     tools=[send_whatsapp_text, send_whatsapp_template]
 )
@@ -102,7 +102,7 @@ message_summary_agent = Agent(
        📩 New Inquiry Summary
        Client: [Customer Name] ([Customer Phone])
        Summary: There is a client who is asking about [Topic/Inquiry details].
-    4. Use send_whatsapp_text to send the alert to the supervisor.
+    4. Use send_whatsapp_text to send the alert to the {SUPERVIOSR?}.
     """,
     tools=[send_whatsapp_text, send_whatsapp_template]
 )
