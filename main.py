@@ -58,4 +58,94 @@ HTML_TEMPLATE = """
                     <td>{{ item.time }}</td>
                     <td><strong>{{ item.contact_name }}</strong></td>
                     <td>{{ item.platform_id }}</td>
-                    <td><strong style="color: #2b6cb0;">{{
+                    <td><strong style="color: #2b6cb0;">{{ item.agent_name }}</strong></td>
+                    <td><span style="color: #38a169; font-weight: 600;">{{ item.status }}</span></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty">No chat assignments received yet. Assign a conversation in Azeer to test.</div>
+        {% endif %}
+    </div>
+</body>
+</html>
+"""
+
+def send_azeer_template(recipient_phone: str, template_name: str, client_name: str):
+    headers = {
+        "Authorization": f"Bearer {AZEER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "to": recipient_phone,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": "ar"},
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": client_name}]
+                }
+            ]
+        }
+    }
+    try:
+        res = requests.post(AZEER_SEND_URL, json=payload, headers=headers)
+        return res.json()
+    except Exception as e:
+        logging.error("Failed to send template: %s", e)
+        return None
+
+@app.route("/", methods=["GET", "POST"])
+def webhook():
+    if request.method == "GET":
+        return render_template_string(HTML_TEMPLATE, logs=ASSIGNMENT_LOGS)
+
+    data = request.get_json(silent=True) or {}
+    logging.info("AZEER RAW EVENT: %s", json.dumps(data, ensure_ascii=False))
+
+    event_type = data.get("webhook_event_type")
+
+    if event_type == "chat_assigned":
+        contact_name = data.get("contact_name") or "Unknown"
+        platform_id = data.get("platform_id") or "Unknown"
+        agent_name = data.get("agent_name") or "Unassigned"
+        status = data.get("status") or "assigned"
+
+        now = datetime.now(timezone.utc)
+        current_time_str = now.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        # Overwrite previous entry if this update arrives within 5 seconds for the same customer
+        if platform_id in LAST_PROCESSED:
+            time_diff = (now - LAST_PROCESSED[platform_id]["time"]).total_seconds()
+            if time_diff <= 5.0 and ASSIGNMENT_LOGS:
+                # Update top row in place with the final assignee
+                ASSIGNMENT_LOGS[0]["agent_name"] = agent_name
+                ASSIGNMENT_LOGS[0]["time"] = current_time_str
+                LAST_PROCESSED[platform_id]["time"] = now
+                logging.info(f"Updated in-place to final agent: {agent_name}")
+                return jsonify({"status": "updated_to_final_agent"}), 200
+
+        # Fresh new assignment entry
+        log_entry = {
+            "time": current_time_str,
+            "contact_name": contact_name,
+            "platform_id": platform_id,
+            "agent_name": agent_name,
+            "status": status
+        }
+        ASSIGNMENT_LOGS.insert(0, log_entry)
+        if len(ASSIGNMENT_LOGS) > 50:
+            ASSIGNMENT_LOGS.pop()
+
+        LAST_PROCESSED[platform_id] = {"time": now}
+
+        if platform_id != "Unknown":
+            send_azeer_template(platform_id, APPROVED_TEMPLATE_NAME, contact_name)
+
+    return jsonify({"status": "received"}), 200
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
