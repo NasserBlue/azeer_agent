@@ -1,25 +1,20 @@
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify, render_template_string
 import requests
-from google import genai
 
 logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 
-# --- In-Memory Log Store ---
-# Keeps the latest 50 assignment events
 ASSIGNMENT_LOGS = []
+LAST_PROCESSED = {}  # {platform_id: {"time": datetime, "agent": str}}
 
-# --- Azeer Credentials ---
+# Credentials
 AZEER_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhZG1pbiI6dHJ1ZSwiaHR0cHM6Ly9oYXN1cmEuaW8vand0L2NsYWltcyI6eyJ4LWF2Yy1hcGlrZXktaWQiOiI3MzBlMDhiMi00MGQzLTRlMmMtYjA3NS1hOGIyYjhhNDEwOWEiLCJ4LWF2Yy1hcGlrZXktc2NvcGUiOiJpbnNlcnQiLCJ4LWF2Yy1ob3N0LWlkIjoiZjNjZWZhMGUtYmQyYi00NjY0LWE5MzUtZmY5ZTc4MDY3MGRmIiwieC1hdmMtcGxhdGZvcm0taWQiOiJuYXNzZXJqLjdAaG90bWFpbC5jb20iLCJ4LWF2Yy1wbGF0Zm9ybS10eXBlIjoiYXZvY2FkbyIsIngtaGFzdXJhLWFsbG93ZWQtcm9sZXMiOlsiYWRtaW4iLCJzdXBlcmFkbWluIl0sIngtaGFzdXJhLWJ1c2luZXNzLWlkIjoiMGRlODhlZjEtNmM1Ny00NTZhLWE0M2QtN2E4MjQwYWUzMDE3IiwieC1oYXN1cmEtZGVmYXVsdC1yb2xlIjoiYWRtaW4iLCJ4LWhhc3VyYS1wcm9maWxlLWlkIjoiNDExIiwieC1oYXN1cmEtdXNlci1pZCI6IjQxMSJ9LCJpYXQiOjE3OTM5NjQ4MjAsImlzcyI6ImF2b2NhZG8tY29yZSIsIm5hbWUiOiJOYXNzZXIgQWxKdWJhaWx5Iiwic3ViIjoiNDExIn0.69BPEVYFd-NqIRgcbVxwYApEF0J0wYDmU89up8vlsgE"
 AZEER_SEND_URL = "https://api.mottasl.ai/v1/message/send"
 APPROVED_TEMPLATE_NAME = "welcome_customer"
-
-# --- Gemini Client ---
-ai_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -105,12 +100,12 @@ def send_azeer_template(recipient_phone: str, template_name: str, client_name: s
 
 @app.route("/", methods=["GET", "POST"])
 def webhook():
-    # Browser visits load the live table dashboard
     if request.method == "GET":
         return render_template_string(HTML_TEMPLATE, logs=ASSIGNMENT_LOGS)
 
-    # Handle incoming webhook from Azeer
     data = request.get_json(silent=True) or {}
+    logging.info("PAYLOAD: %s", json.dumps(data, ensure_ascii=False))
+
     event_type = data.get("webhook_event_type")
 
     if event_type == "chat_assigned":
@@ -118,20 +113,40 @@ def webhook():
         platform_id = data.get("platform_id") or "Unknown"
         agent_name = data.get("agent_name") or "Unassigned"
         status = data.get("status") or "assigned"
+        action = data.get("action", "").lower()
 
+        # 1. Skip explicit unassign events if Azeer specifies it
+        if action in ["unassigned", "removed"]:
+            return jsonify({"status": "ignored_unassignment"}), 200
+
+        now = datetime.now(timezone.utc)
+        current_time_str = now.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        # 2. If the same chat triggered within the last 3 seconds, replace the previous entry
+        # so only the latest recipient agent remains
+        if platform_id in LAST_PROCESSED:
+            time_diff = (now - LAST_PROCESSED[platform_id]["time"]).total_seconds()
+            if time_diff < 3.0:
+                if ASSIGNMENT_LOGS and ASSIGNMENT_LOGS[0].get("platform_id") == platform_id:
+                    ASSIGNMENT_LOGS[0]["agent_name"] = agent_name
+                    ASSIGNMENT_LOGS[0]["time"] = current_time_str
+                    LAST_PROCESSED[platform_id] = {"time": now, "agent": agent_name}
+                    return jsonify({"status": "updated_to_new_assignee"}), 200
+
+        # 3. New unique assignment
         log_entry = {
-            "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "time": current_time_str,
             "contact_name": contact_name,
             "platform_id": platform_id,
             "agent_name": agent_name,
             "status": status
         }
-        # Prepend so newest appears at the top
         ASSIGNMENT_LOGS.insert(0, log_entry)
         if len(ASSIGNMENT_LOGS) > 50:
             ASSIGNMENT_LOGS.pop()
 
-        # Send approved template
+        LAST_PROCESSED[platform_id] = {"time": now, "agent": agent_name}
+
         if platform_id != "Unknown":
             send_azeer_template(platform_id, APPROVED_TEMPLATE_NAME, contact_name)
 
