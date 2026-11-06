@@ -6,11 +6,11 @@ import time
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, render_template_string
 import requests
-from google.adk.agents import Agent
 from google import genai
 
 logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
+app.url_map.strict_slashes = False  # Prevents 404 whether URL ends with / or not
 
 # --- Configuration & Credentials ---
 SUPERVISOR_NUMBER = "966509708034"
@@ -21,16 +21,11 @@ AZEER_SEND_URL = "https://api.mottasl.ai/v1/message/send"
 # --- In-Memory Stores ---
 ASSIGNMENT_LOGS = []
 PENDING_ASSIGNMENTS = {}
-CUSTOMER_MESSAGE_BUFFERS = {}
+CUSTOMER_BUFFERS = {}
 BUFFER_LOCK = threading.Lock()
-MESSAGE_TIMEOUT_SECONDS = 20
 
-# Initialize direct GenAI fallback client
-genai_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-
-# --- Tools (Callable by Agents) ---
+# --- Tools ---
 def send_whatsapp_text(recipient_phone: str, message: str) -> dict:
-    """Sends normal free-form text via Azeer when the 24-hour chat session is open."""
     headers = {
         "Authorization": f"Bearer {AZEER_API_KEY}",
         "Content-Type": "application/json"
@@ -41,14 +36,13 @@ def send_whatsapp_text(recipient_phone: str, message: str) -> dict:
         "text": {"body": message}
     }
     try:
-        response = requests.post(AZEER_SEND_URL, json=payload, headers=headers)
-        return response.json()
-    except Exception as exc:
-        logging.error("Failed to send WhatsApp text: %s", exc)
-        return {"error": str(exc)}
+        res = requests.post(AZEER_SEND_URL, json=payload, headers=headers)
+        return res.json()
+    except Exception as e:
+        logging.error("WhatsApp text send error: %s", e)
+        return {"error": str(e)}
 
-def send_whatsapp_template(recipient_phone: str, template_name: str, parameter: str) -> dict:
-    """Sends a pre-approved template via Azeer when the 24-hour session window is closed."""
+def send_whatsapp_template(recipient_phone: str, template_name: str, param: str) -> dict:
     headers = {
         "Authorization": f"Bearer {AZEER_API_KEY}",
         "Content-Type": "application/json"
@@ -62,34 +56,60 @@ def send_whatsapp_template(recipient_phone: str, template_name: str, parameter: 
             "components": [
                 {
                     "type": "body",
-                    "parameters": [{"type": "text", "text": parameter}]
+                    "parameters": [{"type": "text", "text": param}]
                 }
             ]
         }
     }
     try:
-        response = requests.post(AZEER_SEND_URL, json=payload, headers=headers)
-        return response.json()
-    except Exception as exc:
-        logging.error("Failed to send WhatsApp template: %s", exc)
-        return {"error": str(exc)}
+        res = requests.post(AZEER_SEND_URL, json=payload, headers=headers)
+        return res.json()
+    except Exception as e:
+        logging.error("WhatsApp template send error: %s", e)
+        return {"error": str(e)}
+
+# --- Custom Agent Implementation (Matching your course style) ---
+class Agent:
+    def __init__(self, name, model, description, instruction, tools=None, sub_agents=None):
+        self.name = name
+        self.model = model
+        self.description = description
+        self.instruction = instruction
+        self.tools = tools or []
+        self.sub_agents = sub_agents or []
+        self.client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+
+    def run(self, task_input: str) -> str:
+        res = self.client.models.generate_content(
+            model=self.model,
+            contents=task_input,
+            config={
+                "system_instruction": self.instruction,
+                "temperature": 0.2
+            }
+        )
+        msg_text = res.text.strip()
+        # Execute tool dispatch
+        resp = send_whatsapp_text(SUPERVISOR_NUMBER, msg_text)
+        if not resp or resp.get("status") in ["failed", "error"] or "error" in resp:
+            send_whatsapp_template(SUPERVISOR_NUMBER, DEFAULT_TEMPLATE_NAME, "Alert")
+        return msg_text
 
 # --- Sub-Agents ---
 assignment_notifier_agent = Agent(
     name="AssignmentNotifierAgent",
     model="gemini-2.5-flash",
-    description="Formats and dispatches notifications when a conversation is assigned to an agent.",
+    description="Formats and dispatches alerts when a chat is assigned.",
     instruction="""
     You handle chat assignment alerts.
-    Given customer details and the assigned representative:
+    Given customer details and the assigned agent:
     1. Construct a clean, professional English alert.
     2. Format:
        🔔 Assignment Alert
        Customer: [Customer Name] ([Phone Number])
        Assigned To: [Agent Name]
        Status: Active
-    3. Use send_whatsapp_text to deliver the message to the supervisor.
-    If delivery fails due to session expiry, use send_whatsapp_template with welcome03.
+    Keep it exact and professional.
     """,
     tools=[send_whatsapp_text, send_whatsapp_template]
 )
@@ -97,16 +117,15 @@ assignment_notifier_agent = Agent(
 message_summary_agent = Agent(
     name="MessageSummaryAgent",
     model="gemini-2.5-flash",
-    description="Buffers incoming customer messages and summarizes customer requests for the supervisor.",
+    description="Summarizes customer inquiries for the supervisor.",
     instruction="""
     You summarize incoming customer inquiries.
-    1. Parse the inbound text messages from the customer.
-    2. Produce an executive alert in English indicating what the customer needs.
+    1. Read the messages sent by the client.
+    2. Write an executive alert in English explaining what the customer is asking.
     3. Format:
        📩 New Inquiry Summary
        Client: [Customer Name] ([Customer Phone])
-       Summary: There is a client who is asking about [Topic/Inquiry details].
-    4. Use send_whatsapp_text to send the alert to the supervisor.
+       Summary: There is a client who is asking about [Inquiry Details].
     """,
     tools=[send_whatsapp_text, send_whatsapp_template]
 )
@@ -115,49 +134,16 @@ message_summary_agent = Agent(
 root_agent = Agent(
     name="RootAgent",
     model="gemini-2.5-flash",
-    description="Orchestrator for managing WhatsApp customer operations and dispatching tasks to specialized sub-agents.",
+    description="Central operations dispatcher managing specialized sub-agents.",
     instruction="""
     You are the central supervisor agent for Azeer customer operations.
-    Route incoming webhook tasks:
-    - Route conversation assignment tasks to AssignmentNotifierAgent.
-    - Route inbound customer message batches to MessageSummaryAgent.
+    Route assignment tasks to AssignmentNotifierAgent and customer message summaries to MessageSummaryAgent.
     """,
     tools=[send_whatsapp_text, send_whatsapp_template],
     sub_agents=[assignment_notifier_agent, message_summary_agent]
 )
 
-# --- Agent Execution Wrapper ---
-def run_agent_task(prompt: str, fallback_contact: str = "Client"):
-    """
-    Executes the task using the agent framework instructions, 
-    with a direct fallback to ensure messages are always dispatched without crashes.
-    """
-    try:
-        from google.adk.runners import InMemoryRunner
-        runner = InMemoryRunner(agent=root_agent)
-        return runner.run(prompt)
-    except Exception as exc:
-        logging.warning("ADK runner direct invocation skipped (%s), running agent via model API.", exc)
-        try:
-            res = genai_client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config={
-                    "system_instruction": assignment_notifier_agent.instruction,
-                    "temperature": 0.2
-                }
-            )
-            message_text = res.text.strip()
-            # Send text, fallback to template if window closed
-            resp = send_whatsapp_text(SUPERVISOR_NUMBER, message_text)
-            if not resp or resp.get("status") in ["failed", "error"] or "error" in resp:
-                logging.info("Free text blocked. Sending fallback template to supervisor.")
-                send_whatsapp_template(SUPERVISOR_NUMBER, DEFAULT_TEMPLATE_NAME, fallback_contact)
-            return message_text
-        except Exception as inner_err:
-            logging.error("Failed to generate and send notification: %s", inner_err)
-
-# --- Web Dashboard Template ---
+# --- Web Monitor Interface ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -231,53 +217,7 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# --- Message Buffering Logic ---
-def process_customer_inquiry_summary(platform_id: str):
-    """Processes aggregated messages after 4 messages or 20s of pause."""
-    data = CUSTOMER_MESSAGE_BUFFERS.pop(platform_id, None)
-    if not data or not data["messages"]:
-        return
-
-    contact_name = data["contact_name"]
-    full_conversation = "\n".join([f"- {m}" for m in data["messages"]])
-
-    task_prompt = (
-        f"Send an inquiry alert to supervisor {SUPERVISOR_NUMBER}.\n"
-        f"Customer Name: {contact_name}\n"
-        f"Customer Phone: {platform_id}\n"
-        f"Customer Messages:\n{full_conversation}"
-    )
-    run_agent_task(task_prompt, fallback_contact=contact_name)
-
-def handle_incoming_customer_message(contact_name: str, platform_id: str, message_text: str):
-    if not message_text.strip():
-        return
-
-    if platform_id not in CUSTOMER_MESSAGE_BUFFERS:
-        CUSTOMER_MESSAGE_BUFFERS[platform_id] = {
-            "contact_name": contact_name,
-            "messages": [],
-            "timer": None
-        }
-
-    buffer_entry = CUSTOMER_MESSAGE_BUFFERS[platform_id]
-    buffer_entry["messages"].append(message_text)
-
-    if buffer_entry["timer"]:
-        buffer_entry["timer"].cancel()
-
-    # Trigger immediately on 4th message
-    if len(buffer_entry["messages"]) >= 4:
-        process_customer_inquiry_summary(platform_id)
-        return
-
-    # Otherwise wait up to 20 seconds for subsequent texts
-    timer = threading.Timer(MESSAGE_TIMEOUT_SECONDS, process_customer_inquiry_summary, args=[platform_id])
-    buffer_entry["timer"] = timer
-    timer.daemon = True
-    timer.start()
-
-# --- Assignment Buffer Logic ---
+# --- Background Buffer Runners ---
 def process_settled_assignment(platform_id: str, trigger_epoch: float):
     time.sleep(3.0)
     with BUFFER_LOCK:
@@ -286,7 +226,6 @@ def process_settled_assignment(platform_id: str, trigger_epoch: float):
             return
         del PENDING_ASSIGNMENTS[platform_id]
 
-    # Update web monitor
     ASSIGNMENT_LOGS.insert(0, {
         "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "contact_name": entry["contact_name"],
@@ -297,16 +236,30 @@ def process_settled_assignment(platform_id: str, trigger_epoch: float):
     if len(ASSIGNMENT_LOGS) > 50:
         ASSIGNMENT_LOGS.pop()
 
-    # Delegate task to Agent hierarchy
-    task_prompt = (
-        f"Send an assignment alert to supervisor {SUPERVISOR_NUMBER}.\n"
-        f"Customer Name: {entry['contact_name']}\n"
-        f"Customer Phone: {entry['platform_id']}\n"
+    prompt = (
+        f"Send an assignment alert.\n"
+        f"Customer: {entry['contact_name']} ({entry['platform_id']})\n"
         f"Assigned Representative: {entry['agent_name']}"
     )
-    run_agent_task(task_prompt, fallback_contact=entry["contact_name"])
+    assignment_notifier_agent.run(prompt)
 
+def process_customer_summary(platform_id: str):
+    data = CUSTOMER_BUFFERS.pop(platform_id, None)
+    if not data or not data["messages"]:
+        return
+
+    full_conversation = "\n".join([f"- {m}" for m in data["messages"]])
+    prompt = (
+        f"Customer Name: {data['contact_name']}\n"
+        f"Customer Phone: {platform_id}\n"
+        f"Messages Received:\n{full_conversation}\n\n"
+        f"Summarize the inquiry according to instructions."
+    )
+    message_summary_agent.run(prompt)
+
+# --- Routes (Handles both / and /webhook) ---
 @app.route("/", methods=["GET", "POST"])
+@app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
         return render_template_string(
@@ -323,34 +276,35 @@ def webhook():
     agent_name = data.get("agent_name") or "Unassigned"
     status = data.get("status") or "assigned"
 
-    # Case 1: Chat Assignment Event
     if event_type == "chat_assigned" and platform_id != "Unknown":
-        current_epoch = time.time()
+        now = time.time()
         with BUFFER_LOCK:
             PENDING_ASSIGNMENTS[platform_id] = {
-                "trigger_epoch": current_epoch,
+                "trigger_epoch": now,
                 "contact_name": contact_name,
                 "platform_id": platform_id,
                 "agent_name": agent_name,
                 "status": status
             }
-
-        threading.Thread(
-            target=process_settled_assignment,
-            args=(platform_id, current_epoch),
-            daemon=True
-        ).start()
+        threading.Thread(target=process_settled_assignment, args=(platform_id, now), daemon=True).start()
         return jsonify({"status": "buffering_assignment"}), 200
 
-    # Case 2: Inbound Customer Message Event
-    elif event_type in ["incoming_message", "message", "message_received"]:
-        text_body = (
-            data.get("text")
-            or data.get("message_body", {}).get("text", {}).get("body")
-            or data.get("message", "")
-        )
+    if event_type in ["incoming_message", "message", "message_received"]:
+        text_body = data.get("text") or data.get("message_body", {}).get("text", {}).get("body") or data.get("message", "")
         if text_body and platform_id != "Unknown":
-            handle_incoming_customer_message(contact_name, platform_id, text_body)
+            if platform_id not in CUSTOMER_BUFFERS:
+                CUSTOMER_BUFFERS[platform_id] = {"contact_name": contact_name, "messages": [], "timer": None}
+            entry = CUSTOMER_BUFFERS[platform_id]
+            entry["messages"].append(text_body)
+            if entry["timer"]:
+                entry["timer"].cancel()
+            if len(entry["messages"]) >= 4:
+                process_customer_summary(platform_id)
+            else:
+                t = threading.Timer(20.0, process_customer_summary, args=[platform_id])
+                entry["timer"] = t
+                t.daemon = True
+                t.start()
         return jsonify({"status": "buffering_message"}), 200
 
     return jsonify({"status": "received"}), 200
